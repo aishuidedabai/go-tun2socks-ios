@@ -8,7 +8,7 @@ import "C"
 import (
 	"unsafe"
 
-	"github.com/eycorsican/go-tun2socks/component/pool"
+	"github.com/ponyChang/go-tun2socks-ios/component/pool"
 )
 
 //export udpRecvFn
