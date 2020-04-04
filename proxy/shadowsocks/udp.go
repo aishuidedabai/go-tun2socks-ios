@@ -8,8 +8,8 @@ import (
 	"sync"
 	"time"
 
-	sscore "github.com/ponyChang/go-shadowsocks2/core"
-	sssocks "github.com/ponyChang/go-shadowsocks2/socks"
+	sscore "github.com/shadowsocks/go-shadowsocks2/core"
+	sssocks "github.com/shadowsocks/go-shadowsocks2/socks"
 
 	"github.com/ponyChang/go-tun2socks-ios/common/dns"
 	"github.com/ponyChang/go-tun2socks-ios/common/log"
