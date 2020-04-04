@@ -60,8 +60,8 @@ type tcpConn struct {
 
 	pcb           *C.struct_tcp_pcb
 	handler       TCPConnHandler
-	remoteAddr    *net.TCPAddr
-	localAddr     *net.TCPAddr
+	remoteAddr    net.Addr
+	localAddr     net.Addr
 	connKeyArg    unsafe.Pointer
 	connKey       uint32
 	canWrite      *sync.Cond // Condition variable to implement TCP backpressure.
@@ -109,19 +109,13 @@ func newTCPConn(pcb *C.struct_tcp_pcb, handler TCPConnHandler) (TCPConn, error) 
 	conn.state = tcpConnecting
 	conn.Unlock()
 	go func() {
-		err := handler.Handle(TCPConn(conn), conn.remoteAddr)
+		err := handler.Handle(TCPConn(conn), conn.RemoteAddr())
 		if err != nil {
 			conn.Abort()
 		} else {
 			conn.Lock()
 			conn.state = tcpConnected
 			conn.Unlock()
-
-			lwipMutex.Lock()
-			if pcb.refused_data != nil {
-				C.tcp_process_refused_data(pcb)
-			}
-			lwipMutex.Unlock()
 		}
 	}()
 
@@ -158,20 +152,16 @@ func (conn *tcpConn) receiveCheck() error {
 	case tcpNewConn:
 		fallthrough
 	case tcpConnecting:
-		fallthrough
-	case tcpAborting:
-		fallthrough
-	case tcpClosed:
 		return NewLWIPError(LWIP_ERR_CONN)
 	case tcpReceiveClosed:
 		fallthrough
 	case tcpClosing:
 		return NewLWIPError(LWIP_ERR_CLSD)
-	case tcpErrored:
+	case tcpAborting:
 		conn.abortInternal()
 		return NewLWIPError(LWIP_ERR_ABRT)
 	default:
-		panic("unexpected error")
+		return NewLWIPError(LWIP_ERR_CONN)
 	}
 	return nil
 }
@@ -245,7 +235,8 @@ func (conn *tcpConn) writeCheck() error {
 	case tcpAborting:
 		return io.ErrClosedPipe
 	default:
-		panic("unexpected error")
+		// It's not likely we will get here.
+		return fmt.Errorf("connection %v->%v encountered an unknown error (%v)", conn.LocalAddr(), conn.RemoteAddr(), conn.state)
 	}
 	return nil
 }

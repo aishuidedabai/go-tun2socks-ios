@@ -27,13 +27,12 @@ func tcpAcceptFn(arg unsafe.Pointer, newpcb *C.struct_tcp_pcb, err C.err_t) C.er
 		panic("must register a TCP connection handler")
 	}
 
-	if _, nerr := newTCPConn(newpcb, tcpConnHandler); nerr != nil {
-		switch nerr.(*lwipError).Code {
-		case LWIP_ERR_ABRT:
+	if _, err2 := newTCPConn(newpcb, tcpConnHandler); err2 != nil {
+		if err2.(*lwipError).Code == LWIP_ERR_ABRT {
 			return C.ERR_ABRT
-		case LWIP_ERR_OK:
+		} else if err2.(*lwipError).Code == LWIP_ERR_OK {
 			return C.ERR_OK
-		default:
+		} else {
 			return C.ERR_CONN
 		}
 	}
@@ -66,46 +65,28 @@ func tcpRecvFn(arg unsafe.Pointer, tpcb *C.struct_tcp_pcb, p *C.struct_pbuf, err
 	if p == nil {
 		// Peer closed, EOF.
 		err := conn.(TCPConn).LocalClosed()
-		switch err.(*lwipError).Code {
-		case LWIP_ERR_ABRT:
+		if err.(*lwipError).Code == LWIP_ERR_ABRT {
 			return C.ERR_ABRT
-		case LWIP_ERR_OK:
+		} else if err.(*lwipError).Code == LWIP_ERR_OK {
 			return C.ERR_OK
-		default:
-			panic("unexpected error")
 		}
 	}
 
-	var buf []byte
-	var totlen = int(p.tot_len)
-	if p.tot_len == p.len {
-		buf = (*[1 << 30]byte)(unsafe.Pointer(p.payload))[:totlen:totlen]
-	} else {
-		buf = NewBytes(totlen)
-		defer FreeBytes(buf)
-		C.pbuf_copy_partial(p, unsafe.Pointer(&buf[0]), p.tot_len, 0)
-	}
-
-	rerr := conn.(TCPConn).Receive(buf[:totlen])
-	if rerr != nil {
-		switch rerr.(*lwipError).Code {
-		case LWIP_ERR_ABRT:
+	buf := (*[1 << 30]byte)(unsafe.Pointer(p.payload))[:int(p.tot_len):int(p.tot_len)]
+	recvErr := conn.(TCPConn).Receive(buf)
+	if recvErr != nil {
+		if recvErr.(*lwipError).Code == LWIP_ERR_ABRT {
 			return C.ERR_ABRT
-		case LWIP_ERR_OK:
+		} else if recvErr.(*lwipError).Code == LWIP_ERR_OK {
 			return C.ERR_OK
-		case LWIP_ERR_CONN:
-			shouldFreePbuf = false
+		} else if recvErr.(*lwipError).Code == LWIP_ERR_CONN {
 			// Tell lwip we can't receive data at the moment,
 			// lwip will store it and try again later.
-			return C.ERR_CONN
-		case LWIP_ERR_CLSD:
 			shouldFreePbuf = false
-			// lwip won't handle ERR_CLSD error for us, manually
-			// shuts down the rx side.
-			C.tcp_shutdown(tpcb, 1, 0)
+			return C.ERR_CONN
+		} else if recvErr.(*lwipError).Code == LWIP_ERR_CLSD {
+			shouldFreePbuf = false
 			return C.ERR_CLSD
-		default:
-			panic("unexpected error")
 		}
 	}
 
@@ -116,13 +97,10 @@ func tcpRecvFn(arg unsafe.Pointer, tpcb *C.struct_tcp_pcb, p *C.struct_pbuf, err
 func tcpSentFn(arg unsafe.Pointer, tpcb *C.struct_tcp_pcb, len C.u16_t) C.err_t {
 	if conn, ok := tcpConns.Load(getConnKeyVal(arg)); ok {
 		err := conn.(TCPConn).Sent(uint16(len))
-		switch err.(*lwipError).Code {
-		case LWIP_ERR_ABRT:
+		if err.(*lwipError).Code == LWIP_ERR_ABRT {
 			return C.ERR_ABRT
-		case LWIP_ERR_OK:
+		} else {
 			return C.ERR_OK
-		default:
-			panic("unexpected error")
 		}
 	} else {
 		C.tcp_abort(tpcb)
@@ -150,16 +128,14 @@ func tcpErrFn(arg unsafe.Pointer, err C.err_t) {
 func tcpPollFn(arg unsafe.Pointer, tpcb *C.struct_tcp_pcb) C.err_t {
 	if conn, ok := tcpConns.Load(getConnKeyVal(arg)); ok {
 		err := conn.(TCPConn).Poll()
-		switch err.(*lwipError).Code {
-		case LWIP_ERR_ABRT:
+		if err.(*lwipError).Code == LWIP_ERR_ABRT {
 			return C.ERR_ABRT
-		case LWIP_ERR_OK:
+		} else if err.(*lwipError).Code == LWIP_ERR_OK {
 			return C.ERR_OK
-		default:
-			panic("unexpected error")
 		}
 	} else {
 		C.tcp_abort(tpcb)
 		return C.ERR_ABRT
 	}
+	return C.ERR_OK
 }
