@@ -7,8 +7,8 @@ import (
 	"net"
 	"sync"
 
-	sscore "github.com/riobard/go-shadowsocks2/core"
-	sssocks "github.com/riobard/go-shadowsocks2/socks"
+	sscore "github.com/eycorsican/go-shadowsocks2/core"
+	sssocks "github.com/eycorsican/go-shadowsocks2/socks"
 
 	"github.com/ponyChang/go-tun2socks-ios/common/dns"
 	"github.com/ponyChang/go-tun2socks-ios/common/log"
