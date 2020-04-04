@@ -1,6 +1,9 @@
 package core
 
 /*
+#cgo CFLAGS: -I./c/custom -I./c/include
+#cgo android LDFLAGS: -llog
+#include "c/core/ipv4/acd.c"
 #include "c/core/ipv4/autoip.c"
 #include "c/core/ipv4/dhcp.c"
 #include "c/core/ipv4/etharp.c"

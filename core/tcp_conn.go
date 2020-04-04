@@ -1,15 +1,36 @@
 package core
 
 /*
-#cgo CFLAGS: -I./c/include
+#cgo CFLAGS: -I./c/custom -I./c/include
 #include "lwip/tcp.h"
+
+u32_t
+tcp_sndbuf_cgo(struct tcp_pcb *pcb)
+{
+	return tcp_sndbuf(pcb);
+}
+
+void
+tcp_nagle_disable_cgo(struct tcp_pcb *pcb)
+{
+	tcp_nagle_disable(pcb);
+}
+
+void
+tcp_keepalive_settings_cgo(struct tcp_pcb *pcb)
+{
+#if defined(LWIP_TCP_KEEPALIVE) && LWIP_TCP_KEEPALIVE == 1
+	pcb->so_options |= SOF_KEEPALIVE;
+#endif
+}
 */
 import "C"
 import (
 	"errors"
 	"fmt"
+	"github.com/djherbis/buffer"
+	"github.com/djherbis/nio"
 	"io"
-	"math/rand"
 	"net"
 	"sync"
 	"time"
@@ -60,25 +81,22 @@ type tcpConn struct {
 
 	pcb           *C.struct_tcp_pcb
 	handler       TCPConnHandler
-	remoteAddr    net.Addr
-	localAddr     net.Addr
-	connKeyArg    unsafe.Pointer
-	connKey       uint32
-	canWrite      *sync.Cond // Condition variable to implement TCP backpressure.
+	remoteAddr    *net.TCPAddr
+	localAddr     *net.TCPAddr
+	connKey       unsafe.Pointer
 	state         tcpConnState
-	sndPipeReader *io.PipeReader
-	sndPipeWriter *io.PipeWriter
+	sndPipeReader *nio.PipeReader
+	sndPipeWriter *nio.PipeWriter
 	closeOnce     sync.Once
 	closeErr      error
 }
 
 func newTCPConn(pcb *C.struct_tcp_pcb, handler TCPConnHandler) (TCPConn, error) {
-	connKeyArg := newConnKeyArg()
-	connKey := rand.Uint32()
-	setConnKeyVal(unsafe.Pointer(connKeyArg), connKey)
-
-	// Pass the key as arg for subsequent tcp callbacks.
-	C.tcp_arg(pcb, unsafe.Pointer(connKeyArg))
+	lwipMutex.Lock()
+	defer lwipMutex.Unlock()
+	// From badvpn-tun2socks
+	C.tcp_nagle_disable_cgo(pcb)
+	C.tcp_keepalive_settings_cgo(pcb)
 
 	// Register callbacks.
 	setTCPRecvCallback(pcb)
@@ -86,22 +104,24 @@ func newTCPConn(pcb *C.struct_tcp_pcb, handler TCPConnHandler) (TCPConn, error) 
 	setTCPErrCallback(pcb)
 	setTCPPollCallback(pcb, C.u8_t(TCP_POLL_INTERVAL))
 
-	pipeReader, pipeWriter := io.Pipe()
+	buf := buffer.New(0xffff)
+	pipeReader, pipeWriter := nio.Pipe(buf)
 	conn := &tcpConn{
 		pcb:           pcb,
 		handler:       handler,
 		localAddr:     ParseTCPAddr(ipAddrNTOA(pcb.remote_ip), uint16(pcb.remote_port)),
 		remoteAddr:    ParseTCPAddr(ipAddrNTOA(pcb.local_ip), uint16(pcb.local_port)),
-		connKeyArg:    connKeyArg,
-		connKey:       connKey,
-		canWrite:      sync.NewCond(&sync.Mutex{}),
+		connKey:       nil,
 		state:         tcpNewConn,
 		sndPipeReader: pipeReader,
 		sndPipeWriter: pipeWriter,
 	}
 
 	// Associate conn with key and save to the global map.
-	tcpConns.Store(connKey, conn)
+	identifierPtr := GoPointerSave(conn)
+	conn.SetConnKey(identifierPtr)
+	// Pass the pointer identifier subsequent tcp callbacks.
+	C.tcp_arg(pcb, identifierPtr)
 
 	// Connecting remote host could take some time, do it in another goroutine
 	// to prevent blocking the lwip thread.
@@ -109,13 +129,21 @@ func newTCPConn(pcb *C.struct_tcp_pcb, handler TCPConnHandler) (TCPConn, error) 
 	conn.state = tcpConnecting
 	conn.Unlock()
 	go func() {
-		err := handler.Handle(TCPConn(conn), conn.RemoteAddr())
+		lwipMutex.Lock()
+		defer lwipMutex.Unlock()
+		err := handler.Handle(TCPConn(conn), conn.remoteAddr)
 		if err != nil {
 			conn.Abort()
 		} else {
 			conn.Lock()
 			conn.state = tcpConnected
 			conn.Unlock()
+
+			lwipMutex.Lock()
+			if pcb.refused_data != nil {
+				C.tcp_process_refused_data(pcb)
+			}
+			lwipMutex.Unlock()
 		}
 	}()
 
@@ -140,6 +168,11 @@ func (conn *tcpConn) SetWriteDeadline(t time.Time) error {
 	return nil
 }
 
+func (conn *tcpConn) SetConnKey(p unsafe.Pointer) error {
+	conn.connKey = p
+	return nil
+}
+
 func (conn *tcpConn) receiveCheck() error {
 	conn.Lock()
 	defer conn.Unlock()
@@ -152,16 +185,20 @@ func (conn *tcpConn) receiveCheck() error {
 	case tcpNewConn:
 		fallthrough
 	case tcpConnecting:
+		fallthrough
+	case tcpAborting:
+		fallthrough
+	case tcpClosed:
 		return NewLWIPError(LWIP_ERR_CONN)
 	case tcpReceiveClosed:
 		fallthrough
 	case tcpClosing:
 		return NewLWIPError(LWIP_ERR_CLSD)
-	case tcpAborting:
+	case tcpErrored:
 		conn.abortInternal()
 		return NewLWIPError(LWIP_ERR_ABRT)
 	default:
-		return NewLWIPError(LWIP_ERR_CONN)
+		panic("unexpected error")
 	}
 	return nil
 }
@@ -170,11 +207,10 @@ func (conn *tcpConn) Receive(data []byte) error {
 	if err := conn.receiveCheck(); err != nil {
 		return err
 	}
-	n, err := conn.sndPipeWriter.Write(data)
+	_, err := conn.sndPipeWriter.Write(data)
 	if err != nil {
 		return NewLWIPError(LWIP_ERR_CLSD)
 	}
-	C.tcp_recved(conn.pcb, C.u16_t(n))
 	return NewLWIPError(LWIP_ERR_OK)
 }
 
@@ -195,6 +231,11 @@ func (conn *tcpConn) Read(data []byte) (int, error) {
 	if err == io.ErrClosedPipe {
 		err = io.EOF
 	}
+
+	lwipMutex.Lock()
+	C.tcp_recved(conn.pcb, C.u16_t(n))
+	lwipMutex.Unlock()
+
 	return n, err
 }
 
@@ -203,14 +244,29 @@ func (conn *tcpConn) Read(data []byte) (int, error) {
 // again another time. By calling this function, the lwIP thread is assumed to be already
 // locked by the caller.
 func (conn *tcpConn) writeInternal(data []byte) (int, error) {
+	lwipMutex.Lock()
 	err := C.tcp_write(conn.pcb, unsafe.Pointer(&data[0]), C.u16_t(len(data)), C.TCP_WRITE_FLAG_COPY)
 	if err == C.ERR_OK {
-		C.tcp_output(conn.pcb)
+		lwipMutex.Unlock()
 		return len(data), nil
 	} else if err == C.ERR_MEM {
+		lwipMutex.Unlock()
 		return 0, nil
 	}
+	lwipMutex.Unlock()
 	return 0, fmt.Errorf("tcp_write failed (%v)", int(err))
+}
+
+func (conn *tcpConn) tcpOutputInternal() error {
+	lwipMutex.Lock()
+	err := C.tcp_output(conn.pcb)
+	if err != C.ERR_OK {
+		lwipMutex.Unlock()
+		return fmt.Errorf("tcp_output failed (%v)", int(err))
+	}
+	lwipMutex.Unlock()
+	return nil
+
 }
 
 func (conn *tcpConn) writeCheck() error {
@@ -235,8 +291,7 @@ func (conn *tcpConn) writeCheck() error {
 	case tcpAborting:
 		return io.ErrClosedPipe
 	default:
-		// It's not likely we will get here.
-		return fmt.Errorf("connection %v->%v encountered an unknown error (%v)", conn.LocalAddr(), conn.RemoteAddr(), conn.state)
+		panic("unexpected error")
 	}
 	return nil
 }
@@ -244,36 +299,35 @@ func (conn *tcpConn) writeCheck() error {
 func (conn *tcpConn) Write(data []byte) (int, error) {
 	totalWritten := 0
 
-	conn.canWrite.L.Lock()
-	defer conn.canWrite.L.Unlock()
-
 	for len(data) > 0 {
 		if err := conn.writeCheck(); err != nil {
 			return totalWritten, err
 		}
 
-		lwipMutex.Lock()
 		toWrite := len(data)
-		if toWrite > int(conn.pcb.snd_buf) {
+
+		lwipMutex.Lock()
+		sendBufLen := C.tcp_sndbuf_cgo(conn.pcb)
+		lwipMutex.Unlock()
+
+		if toWrite > int(sendBufLen) {
 			// Write at most the size of the LWIP buffer.
-			toWrite = int(conn.pcb.snd_buf)
+			toWrite = int(sendBufLen)
 		}
 		if toWrite > 0 {
 			written, err := conn.writeInternal(data[0:toWrite])
-			totalWritten += written
 			if err != nil {
-				lwipMutex.Unlock()
 				return totalWritten, err
 			}
+			totalWritten += written
 			data = data[written:len(data)]
 		}
-		lwipMutex.Unlock()
-		if len(data) == 0 {
-			break // Don't block if all the data has been written.
-		}
-		conn.canWrite.Wait()
 	}
 
+	err := conn.tcpOutputInternal()
+	if err != nil {
+		return totalWritten, err
+	}
 	return totalWritten, nil
 }
 
@@ -309,31 +363,37 @@ func (conn *tcpConn) Sent(len uint16) error {
 
 func (conn *tcpConn) checkClosing() error {
 	conn.Lock()
-	defer conn.Unlock()
 
 	if conn.state == tcpClosing {
+		conn.Unlock()
+
+		conn.release()
 		conn.closeInternal()
 		return NewLWIPError(LWIP_ERR_OK)
 	}
+	conn.Unlock()
 	return nil
 }
 
 func (conn *tcpConn) checkAborting() error {
 	conn.Lock()
-	defer conn.Unlock()
 
 	if conn.state == tcpAborting {
+		conn.Unlock()
+
+		conn.release()
 		conn.abortInternal()
 		return NewLWIPError(LWIP_ERR_ABRT)
 	}
+	conn.Unlock()
 	return nil
 }
 
 func (conn *tcpConn) isClosed() bool {
 	conn.Lock()
-	defer conn.Unlock()
-
-	return conn.state == tcpClosed
+	ret := conn.state == tcpClosed
+	conn.Unlock()
+	return ret
 }
 
 func (conn *tcpConn) checkState() error {
@@ -350,9 +410,6 @@ func (conn *tcpConn) checkState() error {
 	if err != nil {
 		return err
 	}
-
-	// Signal the writer to try writting.
-	conn.canWrite.Broadcast()
 
 	return NewLWIPError(LWIP_ERR_OK)
 }
@@ -389,22 +446,33 @@ func (conn *tcpConn) setLocalClosed() error {
 	} else {
 		conn.state = tcpReceiveClosed
 	}
-	conn.canWrite.Broadcast()
 	return nil
 }
 
 // Never call this function outside of the lwIP thread.
 func (conn *tcpConn) closeInternal() error {
+	lwipMutex.Lock()
+	defer lwipMutex.Unlock()
 	C.tcp_arg(conn.pcb, nil)
 	C.tcp_recv(conn.pcb, nil)
 	C.tcp_sent(conn.pcb, nil)
 	C.tcp_err(conn.pcb, nil)
 	C.tcp_poll(conn.pcb, nil, 0)
 
-	conn.release()
-
 	// FIXME Handle error.
 	err := C.tcp_close(conn.pcb)
+	switch err {
+	case C.ERR_OK:
+		// ERR_OK if connection has been closed
+		break
+	case C.ERR_ARG:
+		// invalid pointer or state
+		panic("closeInternal: tcp pcb is invalid")
+	default:
+		// another err_t if closing failed and pcb is not freed
+		// make sure tcp_free is invoked
+		C.tcp_abort(conn.pcb)
+	}
 	if err == C.ERR_OK {
 		return nil
 	} else {
@@ -415,25 +483,24 @@ func (conn *tcpConn) closeInternal() error {
 // Never call this function outside of the lwIP thread since it calls
 // tcp_abort() and in that case we must return ERR_ABRT to lwIP.
 func (conn *tcpConn) abortInternal() {
-	conn.release()
+	lwipMutex.Lock()
+	defer lwipMutex.Unlock()
 	C.tcp_abort(conn.pcb)
 }
 
 func (conn *tcpConn) Abort() {
 	conn.Lock()
-	defer conn.Unlock()
-
 	conn.state = tcpAborting
-	conn.canWrite.Broadcast()
+	conn.Unlock()
 }
 
 func (conn *tcpConn) Err(err error) {
 	conn.Lock()
-	defer conn.Unlock()
+	conn.state = tcpErrored
+	conn.Unlock()
 
 	conn.release()
-	conn.state = tcpErrored
-	conn.canWrite.Broadcast()
+
 }
 
 func (conn *tcpConn) LocalClosed() error {
@@ -442,13 +509,15 @@ func (conn *tcpConn) LocalClosed() error {
 }
 
 func (conn *tcpConn) release() {
-	if _, found := tcpConns.Load(conn.connKey); found {
-		freeConnKeyArg(conn.connKeyArg)
-		tcpConns.Delete(conn.connKey)
-	}
+	lwipMutex.Lock()
+	defer lwipMutex.Unlock()
+
+	GoPointerUnref(conn.connKey)
+
 	conn.sndPipeWriter.Close()
 	conn.sndPipeReader.Close()
 	conn.state = tcpClosed
+
 }
 
 func (conn *tcpConn) Poll() error {
